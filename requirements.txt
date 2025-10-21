@@ -8,3 +8,6 @@ python-dotenv>=1.0
 llama-cpp-python[metal]>=0.3.4
 requests>=2.32
 pydantic>=2.7
+anyio>=4.4
+modelcontextprotocol>=0.1
+spacy>=3.7
