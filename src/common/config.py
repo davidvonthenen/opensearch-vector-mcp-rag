@@ -38,6 +38,13 @@ class Settings:
     server_host: str = "0.0.0.0"
     server_port: int = 8000
 
+    # MCP integration
+    mcp_enabled: bool = False
+    mcp_targets: str = ""
+    mcp_connect_timeout_sec: float = 5.0
+    mcp_invocation_timeout_sec: float = 15.0
+    mcp_max_tool_call_depth: int = 3
+
 
 def _get_int(name: str, default_val: int) -> int:
     v = os.getenv(name)
@@ -54,6 +61,16 @@ def _get_bool(name: str, default_val: bool) -> bool:
     if v is None:
         return default_val
     return v.lower() in ("1", "true", "yes", "on")
+
+
+def _get_float(name: str, default_val: float) -> float:
+    v = os.getenv(name)
+    if v is None or v == "":
+        return default_val
+    try:
+        return float(v)
+    except ValueError:
+        return default_val
 
 
 def load_settings(env_file: str | None = None) -> Settings:
@@ -87,6 +104,13 @@ def load_settings(env_file: str | None = None) -> Settings:
         rag_num_candidates=_get_int("RAG_NUM_CANDIDATES", Settings.rag_num_candidates),
         server_host=os.getenv("SERVER_HOST", Settings.server_host),
         server_port=_get_int("SERVER_PORT", Settings.server_port),
+        mcp_enabled=_get_bool("MCP_ENABLED", Settings.mcp_enabled),
+        mcp_targets=os.getenv("MCP_TARGETS", Settings.mcp_targets),
+        mcp_connect_timeout_sec=_get_float("MCP_CONNECT_TIMEOUT_SEC", Settings.mcp_connect_timeout_sec),
+        mcp_invocation_timeout_sec=_get_float(
+            "MCP_INVOCATION_TIMEOUT_SEC", Settings.mcp_invocation_timeout_sec
+        ),
+        mcp_max_tool_call_depth=_get_int("MCP_MAX_TOOL_CALL_DEPTH", Settings.mcp_max_tool_call_depth),
     )
 
 
