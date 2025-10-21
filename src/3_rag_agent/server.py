@@ -140,12 +140,29 @@ class LlamaCppBackend(LLMBackend):
                 return self._llama.create_chat_completion(messages=list(messages), **kwargs)  # type: ignore
             raise
 
+    def warm_up(self) -> None:
+        """Eagerly load the underlying llama.cpp model."""
+
+        if self._llama is not None:
+            return
+        start = time.time()
+        LOGGER.info("Preloading llama.cpp model during server startup...")
+        self._ensure_loaded()
+        elapsed = time.time() - start
+        LOGGER.info("llama.cpp model ready (%.2fs)", elapsed)
+
 
 SETTINGS = load_settings()
 EMBEDDER = EmbeddingModel(SETTINGS)
 OPENSEARCH_CLIENT = create_client(SETTINGS)
 ensure_index(SETTINGS, EMBEDDER.dimension)
 LLM = LlamaCppBackend(SETTINGS)
+
+try:
+    LLM.warm_up()
+except Exception:  # noqa: BLE001
+    LOGGER.exception("Failed to preload llama.cpp model during startup")
+    raise
 
 MCP_CLIENT: MCPClient | None = None
 TOOL_BUS: ToolBus | None = None
