@@ -1,277 +1,290 @@
-"""Flask server exposing an OpenAI-style chat completions endpoint with resilient llama.cpp init."""
+"""Flask server bridging OpenSearch RAG with an MCP-driven llama.cpp backend."""
 from __future__ import annotations
 
+import json
 import time
 import uuid
+from threading import Lock
 from typing import Any, Dict, List, Sequence
 
 from flask import Flask, jsonify, request
-from opensearchpy.exceptions import RequestError
+from openai import OpenAI
+from opensearchpy.exceptions import OpenSearchException
 
-from ..common.config import Settings, load_settings
-from ..common.embeddings import EmbeddingModel, to_list
 from ..common.logging import get_logger
-from ..common.opensearch_client import create_client, ensure_index, knn_search
+from .config import AgentConfig, load_config
+from .mcp_client import MCPClientError, MCPHttpClient
+from .opensearch_store import OpenSearchStore, RetrievedDocument
 
 LOGGER = get_logger(__name__)
 APP = Flask(__name__)
+CONFIG: AgentConfig = load_config()
+STORE = OpenSearchStore(CONFIG)
+LLM_CLIENT = OpenAI(base_url=CONFIG.llm_base_url, api_key=CONFIG.llm_api_key)
+MCP_CLIENT = MCPHttpClient(CONFIG.mcp_http_url)
+_MCP_INITIALIZED = False
+_MCP_LOCK = Lock()
 
-_GPU_OOM_SIGNS = (
-    "Insufficient Memory",
-    "kIOGPUCommandBufferCallbackErrorOutOfMemory",
-    "ggml_metal_graph_compute",
-    "llama_decode returned -3",
+_NEWS_TOOL_DEFINITION = {
+    "type": "function",
+    "function": {
+        "name": "news.search",
+        "description": "Return mock latest news for a query.",
+        "parameters": {
+            "type": "object",
+            "properties": {
+                "query": {"type": "string", "description": "search string"},
+                "limit": {
+                    "type": "integer",
+                    "minimum": 1,
+                    "maximum": 10,
+                    "default": 5,
+                },
+            },
+            "required": ["query"],
+        },
+    },
+}
+
+_INITIAL_SYSTEM_PROMPT = (
+    "You are a news-focused RAG agent. Always start by calling the news.search tool "
+    "with the user query verbatim before forming an answer."
+)
+_FINAL_SYSTEM_PROMPT = (
+    "You are a BBC news analyst. Synthesize an answer using the MCP news results and "
+    "the OpenSearch context. Cite news items as [news:<id>] and OpenSearch documents as "
+    "[doc:<number>]. If information is missing, respond that you do not know."
 )
 
 
-class LLMBackend:
-    """Abstract interface for language model backends."""
-
-    def chat(self, messages: Sequence[Dict[str, str]], **gen_kwargs: Any) -> Dict[str, Any]:
-        raise NotImplementedError
-
-
-class LlamaCppBackend(LLMBackend):
-    """llama-cpp-python implementation with automatic Metal->CPU fallback."""
-
-    def __init__(self, settings: Settings) -> None:
-        self.settings = settings
-        self._llama = None
-        self._init_mode = "uninitialized"
-
-    def _build_kwargs(self, *, n_ctx: int | None = None, n_gpu_layers: int | None = None, low_vram: bool | None = None):
-        # Defer import so that unit tests don't require llama_cpp
-        from llama_cpp import Llama  # noqa: F401
-
-        kw = dict(
-            model_path=self.settings.llama_model_path,
-            n_ctx=int(n_ctx if n_ctx is not None else self.settings.llama_ctx),
-            n_threads=int(self.settings.llama_n_threads),
-            n_gpu_layers=int(n_gpu_layers if n_gpu_layers is not None else self.settings.llama_n_gpu_layers),
-            n_batch=int(getattr(self.settings, "llama_n_batch", 256)),
-            low_vram=bool(self.settings.llama_low_vram if low_vram is None else low_vram),
-            use_mmap=True,
-            use_mlock=False,
-            verbose=False,
-        )
-        if hasattr(self.settings, "llama_n_ubatch") and self.settings.llama_n_ubatch:
-            kw["n_ubatch"] = int(self.settings.llama_n_ubatch)
-        return kw
-
-    def _load_model(self, *, mode: str) -> None:
-        from llama_cpp import Llama
-
-        if mode == "gpu":
-            kwargs = self._build_kwargs()
-        elif mode == "cpu":
-            kwargs = self._build_kwargs(n_gpu_layers=0, n_ctx=min(self.settings.llama_ctx, 4096))
-        else:
-            raise ValueError(f"Unknown init mode: {mode}")
-        LOGGER.info("Loading llama.cpp model (%s) with kwargs: %s", mode, {k: v for k, v in kwargs.items() if k != "model_path"})
-        self._llama = Llama(**kwargs)
-        self._init_mode = mode
-
-    def _ensure_loaded(self) -> None:
-        """Try GPU init first; fall back to CPU if Metal runs out of memory."""
-        if self._llama is not None:
+def _ensure_mcp_initialized() -> None:
+    global _MCP_INITIALIZED
+    if _MCP_INITIALIZED:
+        return
+    with _MCP_LOCK:
+        if _MCP_INITIALIZED:
             return
         try:
-            self._load_model(mode="gpu")
-        except Exception as e:  # noqa: BLE001
-            msg = str(e)
-            if any(marker in msg for marker in _GPU_OOM_SIGNS):
-                LOGGER.warning("Metal init failed due to memory pressure (%s). Falling back to CPU...", msg)
-                self._load_model(mode="cpu")
-            else:
-                raise
-
-    def chat(self, messages: Sequence[Dict[str, str]], **gen_kwargs: Any) -> Dict[str, Any]:
-        self._ensure_loaded()
-        try:
-            return self._llama.create_chat_completion(messages=list(messages), **gen_kwargs)  # type: ignore
-        except RuntimeError as e:
-            # If decode fails under GPU due to KV cache / Metal OOM, drop to CPU with smaller context and retry once.
-            msg = str(e)
-            if self._init_mode == "gpu" and any(marker in msg for marker in _GPU_OOM_SIGNS):
-                LOGGER.warning("llama.cpp decode failed under GPU (%s). Reinitializing on CPU with smaller context and retrying...", msg)
-                self._llama = None
-                self._load_model(mode="cpu")
-                if "max_tokens" not in gen_kwargs or int(gen_kwargs["max_tokens"]) > 256:
-                    gen_kwargs["max_tokens"] = 256
-                return self._llama.create_chat_completion(messages=list(messages), **gen_kwargs)  # type: ignore
-            raise
+            MCP_CLIENT.initialize()
+            MCP_CLIENT.tools_list()
+            _MCP_INITIALIZED = True
+        except MCPClientError as exc:
+            LOGGER.warning("Unable to initialize MCP server: %s", exc)
 
 
-SETTINGS = load_settings()
-EMBEDDER = EmbeddingModel(SETTINGS)
-OPENSEARCH_CLIENT = create_client(SETTINGS)
-ensure_index(SETTINGS, EMBEDDER.dimension)
-LLM = LlamaCppBackend(SETTINGS)
-
-
-def _extract_user_question(messages: Sequence[Dict[str, str]]) -> str:
+def _extract_user_question(messages: Sequence[Dict[str, Any]]) -> str:
     for message in reversed(messages):
         if message.get("role") == "user":
-            content = message.get("content", "").strip()
-            if content:
-                return content
+            content = message.get("content", "")
+            if isinstance(content, str) and content.strip():
+                return content.strip()
     raise ValueError("No user message found in request")
 
 
-def _trim_snippet(text: str, max_length: int = 900) -> str:
-    """Trim long snippets; keep memory footprint reasonable on M1."""
-    if len(text) <= max_length:
-        return text
-    trimmed = text[:max_length]
-    last_space = trimmed.rfind(" ")
-    if last_space == -1:
-        return trimmed + "..."
-    return trimmed[:last_space] + "..."
+def _serialize_documents(documents: Sequence[RetrievedDocument]) -> List[Dict[str, Any]]:
+    return [doc.to_summary() for doc in documents]
 
 
-def _build_context_block(hits: List[Dict[str, Any]]) -> str:
-    parts = []
-    for idx, hit in enumerate(hits, start=1):
-        source = hit.get("_source", {})
-        snippet = _trim_snippet(source.get("text", ""))
-        parts.append(
-            "[DOC {idx} | source: {category}/{title} | path: {path}]\n{snippet}".format(
-                idx=idx,
-                category=source.get("category", "unknown"),
-                title=source.get("title", "unknown"),
-                path=source.get("path", ""),
-                snippet=snippet,
-            )
-        )
-    return "\n\n".join(parts)
-
-
-def _rag_hits_from_response(response: Dict[str, Any]) -> List[Dict[str, Any]]:
-    hits = []
-    for hit in response.get("hits", {}).get("hits", []):
-        source = hit.get("_source", {})
-        hits.append(
+def _assistant_message_dict(choice_message: Any) -> Dict[str, Any]:
+    tool_calls = []
+    for call in getattr(choice_message, "tool_calls", []) or []:
+        tool_calls.append(
             {
-                "path": source.get("path", ""),
-                "title": source.get("title", ""),
-                "category": source.get("category", ""),
-                "score": float(hit.get("_score", 0.0)),
+                "id": call.id,
+                "type": call.type,
+                "function": {
+                    "name": call.function.name,
+                    "arguments": call.function.arguments,
+                },
             }
         )
-    return hits
+    return {
+        "role": choice_message.role,
+        "content": choice_message.content or "",
+        "tool_calls": tool_calls,
+    }
 
 
-def _compose_messages(question: str, context_block: str) -> List[Dict[str, str]]:
-    system_prompt = (
-        "You are a fact-focused assistant. Use only the provided context snippets. "
-        "If the answer is not grounded in the snippets, respond with 'I don't know.' "
-        "Cite sources inline like [source: ] when drawing from a snippet."
-    )
-    user_prompt = (
-        f"Question:\n{question}\n\nContext:\n{context_block if context_block else 'No context available.'}"
-    )
-    return [
-        {"role": "system", "content": system_prompt},
-        {"role": "user", "content": user_prompt},
-    ]
-
-
-def _normalize_rag_params(payload: Dict[str, Any], settings: Settings) -> tuple[int, int]:
-    rag_config = payload.get("rag", {}) if isinstance(payload.get("rag"), dict) else {}
-    k = int(rag_config.get("k", settings.rag_top_k))
-    num_candidates = int(rag_config.get("num_candidates", settings.rag_num_candidates))
-    return k, num_candidates
+def _sum_usage(*usages: Any) -> Dict[str, int]:
+    totals = {"prompt_tokens": 0, "completion_tokens": 0, "total_tokens": 0}
+    for usage in usages:
+        if usage is None:
+            continue
+        totals["prompt_tokens"] += getattr(usage, "prompt_tokens", 0) or 0
+        totals["completion_tokens"] += getattr(usage, "completion_tokens", 0) or 0
+        totals["total_tokens"] += getattr(usage, "total_tokens", 0) or 0
+    return totals
 
 
 @APP.post("/v1/chat/completions")
-def chat_completions():
+def chat_completions() -> Any:
     payload = request.get_json(force=True, silent=False)
     if not isinstance(payload, dict):
         return jsonify({"error": "Invalid JSON payload"}), 400
 
+    messages = payload.get("messages")
+    if not isinstance(messages, list):
+        return jsonify({"error": "messages must be a list"}), 400
+
     try:
-        question = _extract_user_question(payload.get("messages", []))
+        question = _extract_user_question(messages)
     except ValueError as exc:
         return jsonify({"error": str(exc)}), 400
 
-    k, num_candidates = _normalize_rag_params(payload, SETTINGS)
-
-    # Embed query and fetch RAG context
-    embedding = EMBEDDER.encode([question])[0]
     try:
-        search_response = knn_search(
-            OPENSEARCH_CLIENT,
-            SETTINGS.opensearch_index,
-            to_list(embedding),
-            k=k,
-            num_candidates=num_candidates,
+        context_block, documents = STORE.retrieve(question, CONFIG.top_k)
+    except OpenSearchException as exc:
+        LOGGER.exception("OpenSearch query failed: %s", exc)
+        return jsonify({"error": "OpenSearch query failed", "details": str(exc)}), 502
+    except Exception as exc:  # noqa: BLE001
+        LOGGER.exception("Unexpected error retrieving OpenSearch context")
+        return jsonify({"error": "OpenSearch retrieval failed", "details": str(exc)}), 502
+
+    _ensure_mcp_initialized()
+
+    initial_messages = [
+        {"role": "system", "content": _INITIAL_SYSTEM_PROMPT},
+        {"role": "user", "content": question},
+    ]
+
+    try:
+        initial_completion = LLM_CLIENT.chat.completions.create(
+            model=CONFIG.llm_model,
+            messages=initial_messages,
+            tools=[_NEWS_TOOL_DEFINITION],
+            tool_choice={"type": "function", "function": {"name": "news.search"}},
+            temperature=float(payload.get("temperature", 0.2)),
         )
-    except RequestError as exc:
-        detail = getattr(exc, "info", None) or str(exc)
-        LOGGER.exception("OpenSearch query failed: %s", detail)
-        return jsonify({"error": "OpenSearch query failed", "details": detail}), 400
+    except Exception as exc:  # noqa: BLE001
+        LOGGER.exception("Initial LLM call failed")
+        return jsonify({"error": "LLM tool planning failed", "details": str(exc)}), 502
 
-    hits = search_response.get("hits", {}).get("hits", [])
-    context_block = _build_context_block(hits)
-    messages = _compose_messages(question, context_block)
+    initial_choice = initial_completion.choices[0]
+    assistant_message = _assistant_message_dict(initial_choice.message)
+    tool_calls = assistant_message.get("tool_calls", [])
+    if not tool_calls:
+        assistant_message.pop("tool_calls", None)
 
-    # Keep generation limits conservative on laptops
-    default_max_tokens = min(1024, int(payload.get("max_tokens", 1024)))
-    llm_response = LLM.chat(
-        messages,
-        temperature=float(payload.get("temperature", 0.2)),
-        top_p=float(payload.get("top_p", 0.95)),
-        max_tokens=default_max_tokens,
+    news_results: List[Dict[str, Any]] | None = None
+    tool_error: str | None = None
+    tool_messages: List[Dict[str, Any]] = []
+
+    if not tool_calls:
+        tool_error = "LLM did not return the required news.search tool call."
+    else:
+        for call in tool_calls:
+            if call["function"]["name"] != "news.search":
+                continue
+            try:
+                arguments = json.loads(call["function"]["arguments"] or "{}")
+            except json.JSONDecodeError as exc:
+                tool_error = f"Invalid tool arguments from LLM: {exc}"  # noqa: TRY400
+                break
+            try:
+                call_result = MCP_CLIENT.tools_call("news.search", arguments)
+                if call_result.is_error:
+                    tool_error = "MCP reported an error during news.search."
+                else:
+                    structured = call_result.structured_content
+                    if structured is None:
+                        news_results = None
+                    else:
+                        news_results = structured
+                        pretty_json = json.dumps(news_results, indent=2)
+                        tool_messages.append(
+                            {
+                                "role": "tool",
+                                "tool_call_id": call["id"],
+                                "name": "news.search",
+                                "content": pretty_json,
+                            }
+                        )
+                break
+            except MCPClientError as exc:
+                tool_error = f"Failed to execute news.search: {exc}"
+                break
+        else:
+            tool_error = "news.search tool call missing in LLM response."
+
+    if news_results is None and tool_error is None:
+        tool_error = "news.search did not return structured results."
+
+    final_messages: List[Dict[str, Any]] = [
+        {"role": "system", "content": _FINAL_SYSTEM_PROMPT},
+        assistant_message,
+        *tool_messages,
+    ]
+
+    if tool_error:
+        final_messages.append(
+            {
+                "role": "system",
+                "content": f"MCP tool execution issue: {tool_error}",
+            }
+        )
+    final_messages.append(
+        {
+            "role": "system",
+            "content": "OpenSearch Context:\n" + (context_block or "No relevant context retrieved."),
+        }
     )
+    final_messages.append({"role": "user", "content": question})
 
-    usage = llm_response.get("usage", {})
-    choice = llm_response.get("choices", [{}])[0]
-    assistant_message = choice.get("message", {})
+    try:
+        final_completion = LLM_CLIENT.chat.completions.create(
+            model=CONFIG.llm_model,
+            messages=final_messages,
+            temperature=float(payload.get("temperature", 0.2)),
+            top_p=float(payload.get("top_p", 0.9)),
+            max_tokens=int(payload.get("max_tokens", 512)),
+        )
+    except Exception as exc:  # noqa: BLE001
+        LOGGER.exception("Final LLM call failed")
+        return jsonify({"error": "LLM response generation failed", "details": str(exc)}), 502
+
+    final_choice = final_completion.choices[0]
+    final_message = {
+        "role": final_choice.message.role,
+        "content": final_choice.message.content or "",
+    }
+
+    usage = _sum_usage(initial_completion.usage, final_completion.usage)
 
     response_body = {
-        "id": str(uuid.uuid4()),
+        "id": final_completion.id or str(uuid.uuid4()),
         "object": "chat.completion",
         "created": int(time.time()),
-        "model": payload.get("model", "local-llama"),
+        "model": payload.get("model", CONFIG.llm_model),
         "choices": [
             {
                 "index": 0,
-                "message": {
-                    "role": assistant_message.get("role", "assistant"),
-                    "content": assistant_message.get("content", ""),
-                },
-                "finish_reason": choice.get("finish_reason", "stop"),
+                "message": final_message,
+                "finish_reason": final_choice.finish_reason,
             }
         ],
-        "usage": {
-            "prompt_tokens": usage.get("prompt_tokens", 0),
-            "completion_tokens": usage.get("completion_tokens", 0),
-            "total_tokens": usage.get("total_tokens", 0),
-        },
+        "usage": usage,
         "rag_context": {
-            "index": SETTINGS.opensearch_index,
-            "k": k,
-            "num_candidates": num_candidates,
-            "hits": _rag_hits_from_response(search_response),
+            "index": CONFIG.opensearch_index,
+            "k": CONFIG.top_k,
+            "documents": _serialize_documents(documents),
+            "hits": _serialize_documents(documents),
         },
-        "llama_runtime": {
-            "init_mode": getattr(LLM, "_init_mode", "unknown"),
-            "ctx": getattr(SETTINGS, "llama_ctx", None),
-            "n_gpu_layers": getattr(SETTINGS, "llama_n_gpu_layers", None),
-            "n_batch": getattr(SETTINGS, "llama_n_batch", None),
+        "news_search": {
+            "results": news_results or [],
+            "error": tool_error,
         },
     }
     return jsonify(response_body)
 
 
 @APP.get("/__healthz")
-def healthz():
+def healthz() -> Any:
     return jsonify({"status": "ok"})
 
 
 def main() -> None:
-    LOGGER.info("Starting server on %s:%s", SETTINGS.server_host, SETTINGS.server_port)
-    APP.run(host=SETTINGS.server_host, port=SETTINGS.server_port)
+    LOGGER.info("Starting MCP-enabled RAG agent on %s:%s", CONFIG.server_host, CONFIG.server_port)
+    APP.run(host=CONFIG.server_host, port=CONFIG.server_port)
 
 
 if __name__ == "__main__":
