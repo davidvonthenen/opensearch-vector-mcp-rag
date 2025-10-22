@@ -3,8 +3,8 @@ INDEX ?= bbc
 DATA_DIR ?= ./bbc
 HOST ?= 0.0.0.0
 PORT ?= 8000
-QUESTION ?= Tell me about the connection between Ernie Wise and Vodafone.
-# QUESTION ?= How much did OpenAI purchase Windsurf for?
+# QUESTION ?= Tell me about the connection between Ernie Wise and Vodafone.
+QUESTION ?= How much did OpenAI purchase Windsurf for?
 
 .PHONY: ingest agent server query client env mcp-server mcp-server-stdio mcp-server-sse
 
@@ -20,7 +20,7 @@ mcp-server-stdio:
 mcp-server-sse: mcp-server
 
 agent:
-	MCP_ENABLED=1 MCP_TARGETS="sse:http://127.0.0.1:8765/mcp" $(PYTHON) -m src.3_rag_agent.server
+	MCP_TARGETS="sse:http://127.0.0.1:8765/mcp" $(PYTHON) -m src.3_rag_agent.server
 
 server: agent
 

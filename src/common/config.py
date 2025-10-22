@@ -39,7 +39,7 @@ class Settings:
     server_port: int = 8000
 
     # MCP integration
-    mcp_enabled: bool = False
+    mcp_enabled: bool = True
     mcp_targets: str = ""
     mcp_connect_timeout_sec: float = 5.0
     mcp_invocation_timeout_sec: float = 15.0
