@@ -23,7 +23,7 @@ class Settings:
 
     # Llama.cpp
     llama_model_path: str = "neural-chat-7b-v3-3.Q4_K_M.gguf"
-    llama_ctx: int = 4096                    # keep conservative by default on laptops
+    llama_ctx: int = 8192                    # keep conservative by default on laptops
     llama_n_threads: int = max(1, (os.cpu_count() or 4) - 1)
     llama_n_gpu_layers: int = 20             # modest offload; fallback logic drops to CPU if needed
     llama_n_batch: int = 256                 # prompt processing batch
@@ -31,7 +31,7 @@ class Settings:
     llama_low_vram: bool = True              # reduce Metal VRAM usage
 
     # RAG
-    rag_top_k: int = 5
+    rag_top_k: int = 3
     rag_num_candidates: int = 50
 
     # Server
