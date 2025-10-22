@@ -138,63 +138,36 @@ def _extract_named_entities(text: str | None) -> List[str]:
         entities.append(value)
     return entities
 
+OPENAI_WINDSURF_CONTENT = (
+    "Google Is Said to Pay $2.4 Billion for Windsurf Assets, Talent\n\n"
+    "OpenAI, the generative AI company backed by Microsoft (NASDAQ:MSFT), saw its planned $3B acquisition of AI-assisted coding tool Windsurf go into the scrap heap on Friday, according to multiple reports.\n\n"
+    "In addition, Windsurf CEO Varun Mohan, along with co-founder Douglas Chen, and other top talent are joining Google (NASDAQ:GOOG) DeepMind, which operates as an AI research laboratory, The Verge reported. The tech news outlet noted that the former Windsurf employees will focus efforts on Gemini.\n\n"
+    "Google (NASDAQ:GOOGL) will have neither a stake nor control in Windsurf, but will have a nonexclusive license to some Windsurf technology, The Verge added.\n\n"
+    "Late Friday night, The Wall Street Journal reported that Google will pay ~$2.4B to license Windsurf's technology.\n\n"
+    "\"We're excited to welcome some top AI coding talent from Windsurf's team to Google DeepMind to advance our work in agentic coding,\" Google spokesperson Chris Pappas told TechCrunch.\n\n"
+    "Windsurf Head of Business Jeff Wang is becoming its interim CEO, effective immediately, while VP, Global Sales, Graham Moreno, is becoming president.\n\n"
+    "In a post on X, Wang portrayed the development as \"an agreement to kickstart the next phase of the company.\" He added that \"we find ourselves at a crossroads where the company needs to evolve on two, slightly divergent axes. On one axis, we have a responsibility to continue pushing the frontier of model capabilities. On the other hand, we have a responsibility to make the technology more approachable, secure, and reliable for enterprise workloads, the most critical and consequential workloads for society.\"\n\n"
+    "\"Given the rapid pace of innovation, we see an advantage to double down our focus on the enterprise problems, which has long been our primary focus, and we will be continuing to devote resources to taking the wide range of product innovations in the broader market and making them work for enterprise workloads, the most impactful workloads to society,\" a Windsurf blog post reads.\n\n"
+)
 
 _ARTICLES: List[Dict[str, str]] = [
     {
         "id": "mock-001",
         "title": "UK inflation edges lower in August",
-        "summary": "Consumer prices eased slightly as energy costs retreated, according to the ONS.",
+        "content": "Consumer prices eased slightly as energy costs retreated, according to the ONS.",
         "category": "business",
         "url": "https://example.com/articles/mock-001",
         "published_at": "2025-09-21T10:05:00Z",
+        "entities": ["uk", "ons" ],
     },
     {
         "id": "mock-002",
-        "title": "Climate activists target city traffic in coordinated protest",
-        "summary": "Campaigners slowed central London traffic to call for faster decarbonisation.",
+        "title": "OpenAI deal for Windsurf falls apart; Google paying $2.4B for Windsurf tech - reports",
+        "content": OPENAI_WINDSURF_CONTENT,
         "category": "climate",
         "url": "https://example.com/articles/mock-002",
         "published_at": "2025-09-20T07:40:00Z",
-    },
-    {
-        "id": "mock-003",
-        "title": "Premier League clubs eye winter training reforms",
-        "summary": "Managers are exploring overseas warm-weather camps amid fixture congestion concerns.",
-        "category": "sport",
-        "url": "https://example.com/articles/mock-003",
-        "published_at": "2025-09-19T19:15:00Z",
-    },
-    {
-        "id": "mock-004",
-        "title": "Northern tech firms secure record venture funding",
-        "summary": "Investment into Manchester and Leeds start-ups has surged 35% year-on-year.",
-        "category": "technology",
-        "url": "https://example.com/articles/mock-004",
-        "published_at": "2025-09-18T12:30:00Z",
-    },
-    {
-        "id": "mock-005",
-        "title": "New art exhibition reimagines coastal heritage",
-        "summary": "A touring multimedia show celebrates communities adapting to rising sea levels.",
-        "category": "culture",
-        "url": "https://example.com/articles/mock-005",
-        "published_at": "2025-09-17T09:00:00Z",
-    },
-    {
-        "id": "mock-006",
-        "title": "Scientists unveil more efficient offshore turbines",
-        "summary": "The prototype blades could boost renewable output in the North Sea by 12%.",
-        "category": "science",
-        "url": "https://example.com/articles/mock-006",
-        "published_at": "2025-09-16T14:45:00Z",
-    },
-    {
-        "id": "mock-007",
-        "title": "Councils expand free school meal pilots",
-        "summary": "More local authorities are testing universal primary meal schemes to ease child poverty.",
-        "category": "politics",
-        "url": "https://example.com/articles/mock-007",
-        "published_at": "2025-09-15T11:12:00Z",
+        "entities": ["openai_windsurf", "openai_windsurf_google", "windsurf_google", "openai", "google", "windsurf"],
     },
 ]
 
@@ -207,13 +180,21 @@ def fetch_mock_news(topic: str = "", limit: int = 5) -> Dict[str, List[Dict[str,
 
     topic_normalized = topic.lower().strip()
 
+    # we want to match based on entities in the article
     def _matches(article: Dict[str, str]) -> bool:
         if not topic_normalized:
             return True
-        haystack = " ".join([article.get("title", ""), article.get("summary", ""), article.get("category", "")]).lower()
+
+        haystack = " ".join([article.get("title", ""), article.get("category", "")]).lower()
         return topic_normalized in haystack
 
     filtered = [article for article in _ARTICLES if _matches(article)]
+    
+    print("------ ARTICLES BEGIN")
+    for article in filtered:
+        print(f"ID: {article.get('id')}, Title: {article.get('title')}", file=sys.stderr, flush=True)
+    print("------ END ARTICLES", file=sys.stderr, flush=True)
+
     return {"articles": filtered[:limit_val]}
 
 
@@ -450,6 +431,19 @@ class MCPRequestHandler(BaseHTTPRequestHandler):
         except json.JSONDecodeError:
             self._send_json(HTTPStatus.BAD_REQUEST, {"error": "Invalid JSON"})
             return
+        
+        print("-------------- DATA BEGIN")
+        print(payload)
+        print("-------------- DATA END")
+        # {
+        #     "id": "2e24d90a-97d5-4675-b7ac-9dfe8ebb4168",
+        #     "session_id": "e178a76f-be13-4b6c-af43-ea86d0ecce67",
+        #     "tool": "fetch_mock_news",
+        #     "arguments": {
+        #         "limit": 5,
+        #         "prompt": "Tell me about the connection between Ernie Wise and Vodafone."
+        #     }
+        # }
 
         session_id = payload.get("session_id")
         if not isinstance(session_id, str):
