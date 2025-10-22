@@ -164,39 +164,12 @@ _ARTICLES: List[Dict[str, str]] = [
         "id": "mock-002",
         "title": "OpenAI deal for Windsurf falls apart; Google paying $2.4B for Windsurf tech - reports",
         "content": OPENAI_WINDSURF_CONTENT,
-        "category": "climate",
+        "category": "tech",
         "url": "https://example.com/articles/mock-002",
         "published_at": "2025-09-20T07:40:00Z",
         "entities": ["openai_windsurf", "openai_windsurf_google", "windsurf_google", "openai", "google", "windsurf"],
     },
 ]
-
-
-def fetch_mock_news(topic: str = "", limit: int = 5) -> Dict[str, List[Dict[str, str]]]:
-    try:
-        limit_val = max(1, min(int(limit), 50))
-    except Exception:  # noqa: BLE001
-        limit_val = 5
-
-    topic_normalized = topic.lower().strip()
-
-    # we want to match based on entities in the article
-    def _matches(article: Dict[str, str]) -> bool:
-        if not topic_normalized:
-            return True
-
-        haystack = " ".join([article.get("title", ""), article.get("category", "")]).lower()
-        return topic_normalized in haystack
-
-    filtered = [article for article in _ARTICLES if _matches(article)]
-    
-    print("------ ARTICLES BEGIN")
-    for article in filtered:
-        print(f"ID: {article.get('id')}, Title: {article.get('title')}", file=sys.stderr, flush=True)
-    print("------ END ARTICLES", file=sys.stderr, flush=True)
-
-    return {"articles": filtered[:limit_val]}
-
 
 def _build_handshake(session_id: str, *, include_url: bool = False) -> Dict[str, object]:
     handshake: Dict[str, object] = {
@@ -220,83 +193,54 @@ def _handle_invoke(tool: str, arguments: Dict[str, object]) -> Dict[str, object]
                 "message": f"Tool '{tool}' is not available.",
             },
         }
-    topic = str(arguments.get("topic", "")) if isinstance(arguments, dict) else ""
-    limit = arguments.get("limit", 5) if isinstance(arguments, dict) else 5
+
+    limit_arg = arguments.get("limit", 5) if isinstance(arguments, dict) else 5
     prompt = (
         str(arguments.get("prompt", "")).strip()
         if isinstance(arguments, dict)
         else ""
     )
-    LOGGER.info("Invoking fetch_mock_news with topic='%s', limit=%s", topic, limit)
+
+    LOGGER.info("Invoking fetch_mock_news with limit=%s", limit_arg)
     _log_prompt_details(prompt)
 
-    def _safe_limit(value: int) -> int:
-        try:
-            return max(1, min(int(value), 50))
-        except Exception:  # noqa: BLE001
-            return 5
-
-    limit_val = _safe_limit(limit)
-
-    combined_articles: List[Dict[str, str]] = []
-    entity_articles: List[Dict[str, object]] = []
-    seen_ids = set()
-
-    def _extend_from(raw_articles: object, *, source: str) -> None:
-        articles: List[Dict[str, str]] = []
-        if isinstance(raw_articles, list):
-            for item in raw_articles:
-                if isinstance(item, dict):
-                    articles.append(dict(item))
-        if not articles:
-            LOGGER.info("No articles added from %s", source)
-            return
-        for article in articles:
-            article_id = article.get("id")
-            if article_id and article_id in seen_ids:
-                continue
-            if article_id:
-                seen_ids.add(article_id)
-            combined_articles.append(article)
-        LOGGER.info(
-            "Aggregated %s article(s) from %s (total=%s)",
-            len(articles),
-            source,
-            len(combined_articles),
-        )
-
-    if topic:
-        topic_result = fetch_mock_news(topic=topic, limit=limit_val)
-        _extend_from(topic_result.get("articles"), source=f"topic '{topic}'")
+    try:
+        limit = max(1, min(int(limit_arg), 50))
+    except Exception:  # noqa: BLE001 - fall back to default range if parsing fails
+        limit = 5
 
     extracted_entities = _extract_named_entities(prompt)
-    if extracted_entities:
-        LOGGER.info("Server extracted entities from prompt: %s", extracted_entities)
-        print(f"Extracted entities: {extracted_entities}", file=sys.stderr, flush=True)
-        for entity in extracted_entities:
-            LOGGER.info("Fetching articles for extracted entity '%s'", entity)
-            entity_result = fetch_mock_news(topic=entity, limit=limit_val)
-            articles = entity_result.get("articles") if isinstance(entity_result, dict) else []
-            entity_articles.append({"entity": entity, "articles": articles if isinstance(articles, list) else []})
-            _extend_from(articles, source=f"entity '{entity}'")
-    else:
-        LOGGER.info("No entities extracted from prompt on server side.")
+    if not extracted_entities:
+        LOGGER.info("No named entities extracted from the prompt; returning empty result set.")
+        return {"ok": True, "content": {"articles": []}}
 
-    if not combined_articles:
-        LOGGER.info("No topic or entity matches found; returning general headlines.")
-        fallback = fetch_mock_news(topic="", limit=limit_val)
-        fallback_articles = fallback.get("articles") if isinstance(fallback, dict) else []
-        if isinstance(fallback_articles, list):
-            for item in fallback_articles:
-                if isinstance(item, dict):
-                    combined_articles.append(dict(item))
+    LOGGER.info("Server extracted entities from prompt: %s", extracted_entities)
+    print(f"Extracted entities: {extracted_entities}", file=sys.stderr, flush=True)
 
-    response_content: Dict[str, object] = {"articles": combined_articles[:limit_val]}
-    if entity_articles:
-        response_content["entity_articles"] = entity_articles
+    def _normalize(value: str) -> str:
+        return value.strip().lower().replace(" ", "_")
 
-    LOGGER.info("Returning %s article(s) after aggregation", len(response_content.get("articles", [])))
-    return {"ok": True, "content": response_content}
+    normalized_query_entities = {
+        _normalize(entity)
+        for entity in extracted_entities
+        if isinstance(entity, str) and entity.strip()
+    }
+
+    matched_articles: List[Dict[str, str]] = []
+    for article in _ARTICLES:
+        raw_entities = article.get("entities", [])
+        if not isinstance(raw_entities, list):
+            continue
+        normalized_article_entities = {
+            _normalize(str(item))
+            for item in raw_entities
+            if isinstance(item, str) and item.strip()
+        }
+        if normalized_query_entities.intersection(normalized_article_entities):
+            matched_articles.append(article)
+
+    LOGGER.info("Returning %s article(s) that match extracted entities.", len(matched_articles))
+    return {"ok": True, "content": {"articles": matched_articles[:limit]}}
 
 
 def run_stdio_server() -> None:
