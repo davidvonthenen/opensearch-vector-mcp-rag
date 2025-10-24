@@ -3,7 +3,6 @@ INDEX ?= bbc
 DATA_DIR ?= ./bbc
 HOST ?= 0.0.0.0
 PORT ?= 8000
-# QUESTION ?= Tell me about the connection between Ernie Wise and Vodafone.
 QUESTION ?= How much did OpenAI purchase Windsurf for?
 
 .PHONY: ingest agent server query client env mcp-server mcp-server-stdio mcp-server-sse
